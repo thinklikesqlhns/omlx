@@ -13,15 +13,27 @@ import importlib
 import logging
 import os
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 
-from omlx.custom_kernels.nax import is_nax_available
+from omlx.custom_kernels.nax import is_nax_available, nax_ane_path_enabled
 
 logger = logging.getLogger(__name__)
+
+
+@partial(mx.compile, shapeless=True)
+def geglu(gate: mx.array, x: mx.array) -> mx.array:
+    """GELU-gated linear unit (Gemma4 MLP activation).
+
+    Unlike Qwen3.5's swiglu, Gemma4 uses gelu_approx(gate) * up.
+    The NAX QMM kernel only computes the matmul; this activation runs in
+    Python/MLX on the dequantized outputs.
+    """
+    return nn.gelu_approx(gate) * x
 
 _PATCHED = False
 _LINEAR_PATCHED = False
@@ -253,6 +265,7 @@ def _make_patched_mlp(
     variant: int,
     min_tokens: int,
     q8_min_tokens: int,
+    activation: Callable[[mx.array, mx.array], mx.array] = swiglu,
 ):
     def patched(self, x, *args, **kwargs):
         # Decode / short-sequence fast path first: this wrapper runs on every
@@ -289,7 +302,7 @@ def _make_patched_mlp(
 
         gate = _linear_qmm(gate_proj, x, variant)
         up = _linear_qmm(up_proj, x, variant)
-        y = swiglu(gate, up)
+        y = activation(gate, up)
         return _linear_qmm(down_proj, y, variant)
 
     return patched
@@ -301,6 +314,7 @@ def _patch_class(
     variant: int,
     min_tokens: int,
     q8_min_tokens: int,
+    activation: Callable[[mx.array, mx.array], mx.array] = swiglu,
 ) -> bool:
     try:
         module = importlib.import_module(module_name)
@@ -310,7 +324,7 @@ def _patch_class(
     if cls is None or getattr(cls, "_omlx_q4_mlp_patched", False):
         return cls is not None
     orig = cls.__call__
-    cls.__call__ = _make_patched_mlp(orig, variant, min_tokens, q8_min_tokens)
+    cls.__call__ = _make_patched_mlp(orig, variant, min_tokens, q8_min_tokens, activation)
     cls._omlx_q4_mlp_patched = True
     cls._omlx_q4_mlp_original_call = orig
     return True
@@ -345,6 +359,22 @@ def apply_qwen35_q4_mlp_patch() -> bool:
         variant,
         min_tokens,
         q8_min_tokens,
+    )
+    patched |= _patch_class(
+        "mlx_vlm.models.gemma4.language",
+        "MLP",
+        variant,
+        min_tokens,
+        q8_min_tokens,
+        activation=geglu,
+    )
+    patched |= _patch_class(
+        "mlx_lm.models.gemma4_text",
+        "MLP",
+        variant,
+        min_tokens,
+        q8_min_tokens,
+        activation=geglu,
     )
     _PATCHED = patched
     if patched:
@@ -494,6 +524,7 @@ def apply_qwen35_q4_prefill_linear_patch(model) -> bool:
                 "mlx_vlm.models.qwen3_5.",
                 "mlx_vlm.models.qwen3_5_moe.",
                 "mlx_vlm.models.qwen4_exp.",
+                "mlx_vlm.models.gemma4.language.",
             )
         ):
             continue
@@ -761,6 +792,169 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
             q8_min_tokens,
         )
     return installed
+
+
+_GEMMA4_LM_ATTENTION_PATCHED = False
+
+
+def apply_gemma4_q4_lm_prefill_linear_patch() -> bool:
+    """Patch mlx-lm Gemma4 Attention linears for q4 prefill (NAX QMM routing).
+
+    Gemma4 uses standard MHA (no GDN), so only Attention.__call__ is patched.
+    The MLP is already covered by apply_qwen35_q4_mlp_patch() via the
+    mlx_lm.models.gemma4_text.MLP target with GEGLU activation.
+
+    Gemma4 Attention differs from Qwen3.5:
+    - No gate split from q_proj (Qwen3.5 splits q into q+gate).
+    - Supports shared_kv, use_k_eq_v, has_kv, is_sliding.
+    - Returns (output, (keys, values), offset) instead of just output.
+    - Uses RMSNormNoScale for v_norm (no affine).
+    """
+    global _GEMMA4_LM_ATTENTION_PATCHED
+    if _GEMMA4_LM_ATTENTION_PATCHED:
+        return True
+    if os.environ.get("OMLX_QWEN35_Q4_LM_LINEAR", "1") == "0":
+        return False
+    if not _has_native_qmm():
+        logger.debug("Gemma4 LM native qmm unavailable; patch skipped")
+        return False
+    if not nax_ane_path_enabled():
+        logger.debug("NAX path disabled via NAX_ANE_PATH; Gemma4 LM patch skipped")
+        return False
+
+    try:
+        module = importlib.import_module("mlx_lm.models.gemma4_text")
+    except Exception:
+        return False
+
+    variant = int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_VARIANT", "8"))
+    min_tokens = int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048"))
+    q8_min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
+    )
+
+    def should_route(linear: Any, x: mx.array) -> bool:
+        return (
+            x.ndim == 3
+            and _can_route_affine_linear(linear, x, min_tokens, q8_min_tokens)
+            and os.environ.get("OMLX_QWEN35_Q4_LM_LINEAR", "1") != "0"
+        )
+
+    def qmm_or_linear(linear: Any, x: mx.array) -> mx.array:
+        if should_route(linear, x):
+            return _backend_or_qmm(linear, x, variant)
+        return linear(x)
+
+    attn_cls = getattr(module, "Attention", None)
+    if attn_cls is None:
+        return False
+    if getattr(attn_cls, "_omlx_q4_gemma4_attn_patched", False):
+        _GEMMA4_LM_ATTENTION_PATCHED = True
+        return True
+
+    orig_attn = attn_cls.__call__
+    try:
+        attn_module = importlib.import_module(attn_cls.__module__)
+    except Exception:
+        attn_module = None
+
+    def patched_attention(
+        self, x, mask=None, cache=None, shared_kv=None, offset=None
+    ):
+        # Decode/fast-path first: single shape check exits the hot path.
+        if (
+            attn_module is None
+            or x.ndim != 3
+            or x.shape[-2] < min_tokens
+            or os.environ.get("OMLX_QWEN35_Q4_LM_LINEAR", "1") == "0"
+        ):
+            return orig_attn(
+                self, x, mask=mask, cache=cache, shared_kv=shared_kv, offset=offset
+            )
+        # When shared_kv is provided, keys/values are pre-computed —
+        # only q_proj and o_proj need routing. When shared_kv is None,
+        # has_kv must be True (the original raises ValueError otherwise).
+        if shared_kv is not None:
+            route_linears = [self.q_proj, self.o_proj]
+        elif not self.has_kv:
+            # Mirrors the original ValueError for missing shared_kv on
+            # KV-shared layers: fall through instead of crashing.
+            return orig_attn(
+                self, x, mask=mask, cache=cache, shared_kv=shared_kv, offset=offset
+            )
+        else:
+            route_linears = [self.q_proj, self.o_proj, self.k_proj]
+            if not self.use_k_eq_v:
+                route_linears.append(self.v_proj)
+        if not all(
+            should_route(p, x) for p in route_linears if p is not None
+        ):
+            return orig_attn(
+                self, x, mask=mask, cache=cache, shared_kv=shared_kv, offset=offset
+            )
+
+        # Resolve SDPA per-call (TurboQuant may install its own afterward).
+        sdpa = getattr(attn_module, "scaled_dot_product_attention", None)
+        if sdpa is None:
+            return orig_attn(
+                self, x, mask=mask, cache=cache, shared_kv=shared_kv, offset=offset
+            )
+
+        B, L, _ = x.shape
+        queries = qmm_or_linear(self.q_proj, x).reshape(
+            B, L, self.n_heads, self.head_dim
+        )
+        queries = self.q_norm(queries)
+
+        if shared_kv is not None:
+            keys, values = shared_kv
+        else:
+            keys = qmm_or_linear(self.k_proj, x).reshape(
+                B, L, self.n_kv_heads, self.head_dim
+            )
+            if self.use_k_eq_v:
+                values = keys
+            else:
+                values = qmm_or_linear(self.v_proj, x).reshape(
+                    B, L, self.n_kv_heads, self.head_dim
+                )
+            offset = mx.array(cache.offset) if cache is not None else 0
+            keys = self.k_norm(keys)
+            keys = keys.transpose(0, 2, 1, 3)
+            keys = self.rope(keys, offset=offset)
+            values = self.v_norm(values)
+            values = values.transpose(0, 2, 1, 3)
+
+        queries = queries.transpose(0, 2, 1, 3)
+        queries = self.rope(queries, offset=offset)
+
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+
+        output = sdpa(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return qmm_or_linear(self.o_proj, output), (keys, values), offset
+
+    attn_cls.__call__ = patched_attention
+    attn_cls._omlx_q4_gemma4_attn_patched = True
+    attn_cls._omlx_q4_gemma4_attn_original_call = orig_attn
+    attn_cls._omlx_q4_gemma4_attn_wrapper = patched_attention
+    _GEMMA4_LM_ATTENTION_PATCHED = True
+    logger.info(
+        "Gemma4 LM quantized prefill Attention patch applied "
+        "(variant=%d, min_tokens=%d, q8_min_tokens=%d)",
+        variant,
+        min_tokens,
+        q8_min_tokens,
+    )
+    return True
 
 
 _MUSE_PATCHED = False

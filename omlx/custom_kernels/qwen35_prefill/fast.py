@@ -950,8 +950,28 @@ def nax_qmm_kernels_built() -> bool:
     return bool(_ext.nax_qmm_kernels_built())
 
 
+def nax_ane_path_enabled() -> bool:
+    """Master NAX path toggle (default on).
+
+    Set ``NAX_ANE_PATH=0`` (or ``false``/``off``) to force the NAX path off,
+    falling back to classic GPU QMM kernels. This is the top-level switch for
+    comparative A/B testing of Gemma4 (and Qwen) prefill with and without
+    tensor-unit acceleration. Checked *before* the cached hardware detection
+    so runtime env changes are respected immediately.
+
+    ``NAX_ANE_PATH=1`` (default) leaves activation to the downstream
+    ``OMLX_NAX`` / ``OMLX_QWEN35_QMM_NAX`` env vars and hardware detection.
+    """
+    env = os.environ.get("NAX_ANE_PATH", "1").strip().lower()
+    return env not in ("0", "false", "off")
+
+
 def _qmm_use_nax() -> bool:
     global _qmm_nax_cache
+    # Top-level NAX path toggle for A/B testing. Checked before the cache so
+    # runtime env changes are respected immediately.
+    if not nax_ane_path_enabled():
+        return False
     if _qmm_nax_cache is None:
         if os.environ.get("OMLX_QWEN35_QMM_NAX", "").strip().lower() in (
             "0",
@@ -1208,8 +1228,12 @@ def oq_a8_available() -> bool:
 
     Distinct from ``has_symbol``: the binding can exist in a build whose NAX
     metallib was skipped (SDK < 26.2) or on hardware without tensor units.
+    Respects the ``NAX_ANE_PATH`` env var so that oQ A8 NAX dispatch can be
+    disabled for A/B comparison testing.
     """
     if _ext is None or not hasattr(_ext, "oq_a8_kernels_available"):
+        return False
+    if not nax_ane_path_enabled():
         return False
     try:
         return bool(_ext.oq_a8_kernels_available())

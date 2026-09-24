@@ -5,8 +5,15 @@ The implementation lives in qwen35_prefill.fast, which prefers the native
 extension's mirror of mlx metal::is_nax_available() and falls back to parsing
 mx.device_info() when the extension predates the NAX split. Import from here
 in patches that are not Qwen-specific.
+
+``nax_ane_path_enabled`` exposes the ``NAX_ANE_PATH`` env var (default on) so
+tests and patch layers can query whether the NAX path is opted into, separate
+from hardware detection.
 """
 
-from omlx.custom_kernels.qwen35_prefill.fast import is_nax_available
+from omlx.custom_kernels.qwen35_prefill.fast import (
+    is_nax_available,
+    nax_ane_path_enabled,
+)
 
-__all__ = ["is_nax_available"]
+__all__ = ["is_nax_available", "nax_ane_path_enabled"]
